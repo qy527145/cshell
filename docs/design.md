@@ -284,9 +284,10 @@ Unix 上改指是原子的：在同级建一个临时符号链接，再 `rename`
 - `Verdict::Risky` —— 主目录、包含 cwd 的目录，`--force` 可越过
 - `Verdict::Forbidden` —— 卷根、系统关键目录，`--force` **也不行**
 
-`migrate::validate_paths` 管的是另一类：自吞、源目标相同、目标非空、父目录
-不存在。这些不是「危险」，是**纯粹的逻辑错误**，无论如何都会导致数据损坏，
-所以根本没有 force 选项。
+`migrate::validate_paths` 管的是另一类：自吞、源目标相同、目标非空。这些不是
+「危险」，是**纯粹的逻辑错误**，无论如何都会导致数据损坏，所以根本没有 force
+选项。目标的父目录不存在**不**属于这一类 —— 那只是还没建，`migrate::create_parents`
+会在真正动手前逐级补齐（预演模式下不建）。
 
 `Error::Unsafe` 带 `can_force` 字段就是为了让提示语说对话——对一个
 `Forbidden` 的路径提示「加 --force 试试」会把用户带进沟里。

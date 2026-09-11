@@ -17,7 +17,7 @@
 use std::ffi::OsString;
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf, Prefix};
 
 use windows::core::PCWSTR;
 use windows::Wdk::Storage::FileSystem::{
@@ -64,19 +64,30 @@ const ERROR_NOT_SAME_DEVICE: i32 = 17;
 /// 前缀让内核跳过路径解析（包括 MAX_PATH 检查与 `.`/`..` 规范化），是处理
 /// 深层目录树的必要条件。注意：加了前缀后路径必须已是绝对且规范的形式，
 /// 所以这里对相对路径不加前缀。
+///
+/// 「跳过路径解析」也意味着 `/` **不再被当成分隔符** —— 它会原样成为文件名的
+/// 一部分，于是 `\\?\D:/data` 直接撞上 `ERROR_INVALID_NAME`。而用户写
+/// `cshl ./nm D:/data/nm` 是再自然不过的事（Rust 的 `Path` 本身也认 `/`），
+/// 所以加前缀时要把分隔符统一成 `\`。
 pub fn to_wide(path: &Path) -> Vec<u16> {
+    const SLASH: u16 = b'/' as u16;
+    const BACKSLASH: u16 = b'\\' as u16;
+
     let s = path.as_os_str();
     let already_prefixed = {
         let bytes: Vec<u16> = s.encode_wide().take(4).collect();
         // \\?\ == [0x5C, 0x5C, 0x3F, 0x5C]
-        bytes == [0x5C, 0x5C, 0x3F, 0x5C]
+        bytes == [BACKSLASH, BACKSLASH, 0x3F, BACKSLASH]
     };
 
     if path.is_absolute() && !already_prefixed {
         let mut out: Vec<u16> = r"\\?\".encode_utf16().collect();
+        let wide: Vec<u16> = s
+            .encode_wide()
+            .map(|c| if c == SLASH { BACKSLASH } else { c })
+            .collect();
         // UNC 路径 \\server\share 要写成 \\?\UNC\server\share
-        let wide: Vec<u16> = s.encode_wide().collect();
-        if wide.starts_with(&[0x5C, 0x5C]) {
+        if wide.starts_with(&[BACKSLASH, BACKSLASH]) {
             out.extend("UNC".encode_utf16());
             out.extend_from_slice(&wide[1..]); // 保留一个反斜杠
         } else {
@@ -87,6 +98,54 @@ pub fn to_wide(path: &Path) -> Vec<u16> {
     } else {
         s.encode_wide().chain(std::iter::once(0)).collect()
     }
+}
+
+/// 去掉 `\\?\` 前缀，还原成普通的 DOS 路径形式。
+///
+/// `std::fs::canonicalize` 在 Windows 上返回的一律是 `\\?\C:\...` 这种
+/// **verbatim（逐字）** 形式。它适合喂给内核，却不适合出现在任何「会被存下来
+/// 或被人看到」的地方：
+///
+/// - junction 的 SubstituteName 要写成 `\??\C:\path`，直接拼上带前缀的路径
+///   会得到 `\??\\\?\C:\path` —— 内核解析不了，链接看着像建好了，进去却是空的
+/// - 符号链接的目标同理，`\\?\` 会被当成路径的一部分
+/// - 台账以源路径为键，两种写法会被当成两条不同的记录
+///
+/// 反过来不必担心「丢了前缀就过不了 MAX_PATH」——[`to_wide`] 会在每次调用
+/// Win32 API 前重新加上，标准库的 `std::fs` 同样会自己加。
+///
+/// `\\?\Volume{GUID}\` 这类没有 DOS 等价写法的路径原样返回。
+pub fn strip_verbatim(path: &Path) -> PathBuf {
+    let mut comps = path.components();
+
+    let Some(Component::Prefix(prefix)) = comps.next() else {
+        return path.to_path_buf();
+    };
+
+    let mut out = match prefix.kind() {
+        // \\?\C:\... → C:\...
+        Prefix::VerbatimDisk(letter) => PathBuf::from(format!("{}:\\", letter as char)),
+        // \\?\UNC\server\share\... → \\server\share\...
+        Prefix::VerbatimUNC(server, share) => {
+            let mut s = OsString::from(r"\\");
+            s.push(server);
+            s.push(r"\");
+            s.push(share);
+            s.push(r"\");
+            PathBuf::from(s)
+        }
+        // 非 verbatim 前缀（C:、\\server\share）本来就是干净的；
+        // \\?\Volume{...} 则没法去掉前缀，两者都原样返回
+        _ => return path.to_path_buf(),
+    };
+
+    for c in comps {
+        // 根已经包含在上面拼好的头部里了
+        if !matches!(c, Component::RootDir) {
+            out.push(c.as_os_str());
+        }
+    }
+    out
 }
 
 fn last_error() -> io::Error {
@@ -470,7 +529,9 @@ pub fn create_junction(target: &Path, link: &Path) -> io::Result<()> {
 /// 把一个已存在的空目录变成指向 `target` 的 junction。
 fn set_mount_point(link: &Path, target: &Path) -> io::Result<()> {
     // SubstituteName 用 NT 命名空间形式 \??\C:\path，
-    // PrintName 用用户可读的 C:\path。两者都不带 \\?\ 前缀。
+    // PrintName 用用户可读的 C:\path。两者都不带 \\?\ 前缀 ——
+    // 带了会拼出 \??\\\?\C:\path 这种内核解析不了的东西。
+    let target = strip_verbatim(target);
     let target_str = target.as_os_str();
     let print_name: Vec<u16> = target_str.encode_wide().collect();
     let substitute_name: Vec<u16> = r"\??\"
@@ -584,6 +645,7 @@ pub fn create_dir_symlink(target: &Path, link: &Path) -> io::Result<()> {
 
     // 符号链接的目标原样写入，不加 \\?\ 前缀 —— 前缀会被当成路径的一部分
     let l = to_wide(link);
+    let target = strip_verbatim(target);
     let t: Vec<u16> = target
         .as_os_str()
         .encode_wide()
@@ -733,4 +795,48 @@ pub fn read_link_target(path: &Path) -> io::Result<std::path::PathBuf> {
     }
 
     Ok(std::path::PathBuf::from(s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode(w: &[u16]) -> String {
+        let end = w.iter().position(|&c| c == 0).unwrap_or(w.len());
+        String::from_utf16_lossy(&w[..end])
+    }
+
+    #[test]
+    fn to_wide_prefixes_absolute_paths() {
+        assert_eq!(decode(&to_wide(Path::new(r"C:\a\b"))), r"\\?\C:\a\b");
+        // UNC
+        assert_eq!(
+            decode(&to_wide(Path::new(r"\\server\share\d"))),
+            r"\\?\UNC\server\share\d"
+        );
+        // 已经带前缀的不再叠加
+        assert_eq!(decode(&to_wide(Path::new(r"\\?\C:\a"))), r"\\?\C:\a");
+        // 相对路径不加前缀（加了就成非法路径了）
+        assert_eq!(decode(&to_wide(Path::new(r"a\b"))), r"a\b");
+    }
+
+    /// verbatim 前缀会关掉内核的路径解析，`/` 不再是分隔符而会变成文件名的
+    /// 一部分 —— 用户写 `D:/data` 会撞 ERROR_INVALID_NAME。
+    #[test]
+    fn to_wide_normalizes_forward_slashes() {
+        assert_eq!(decode(&to_wide(Path::new("C:/a/b"))), r"\\?\C:\a\b");
+        assert_eq!(decode(&to_wide(Path::new(r"C:\a/b\c"))), r"\\?\C:\a\b\c");
+        assert_eq!(
+            decode(&to_wide(Path::new("//server/share/d"))),
+            r"\\?\UNC\server\share\d"
+        );
+    }
+
+    #[test]
+    fn strip_verbatim_and_to_wide_roundtrip() {
+        for p in [r"C:\a\b", r"\\server\share\d"] {
+            let stripped = strip_verbatim(Path::new(&decode(&to_wide(Path::new(p)))));
+            assert_eq!(stripped, PathBuf::from(p), "{p} 来回转换后应还原");
+        }
+    }
 }

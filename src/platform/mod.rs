@@ -180,6 +180,27 @@ pub fn read_link_target(link: &Path) -> io::Result<std::path::PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// 路径形式
+// ---------------------------------------------------------------------------
+
+/// 把路径还原成「适合存下来、适合给人看、适合写进链接」的形式。
+///
+/// Windows 上去掉 `\\?\` verbatim 前缀 —— `std::fs::canonicalize` 返回的正是
+/// 这种形式，而它一旦流进 junction 的 reparse buffer 就会拼出内核解析不了的
+/// `\??\\\?\C:\path`，流进台账则会让同一个目录出现两种键。
+/// 其他平台上没有这回事，原样返回。
+#[cfg(windows)]
+pub fn strip_verbatim(path: &Path) -> std::path::PathBuf {
+    imp::strip_verbatim(path)
+}
+
+/// 见 windows 版本的文档。非 Windows 平台上是恒等变换。
+#[cfg(not(windows))]
+pub fn strip_verbatim(path: &Path) -> std::path::PathBuf {
+    path.to_path_buf()
+}
+
+// ---------------------------------------------------------------------------
 // 卷信息
 // ---------------------------------------------------------------------------
 
@@ -197,6 +218,39 @@ pub fn volume_id(path: &Path) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_handles_disk_unc_and_unprefixed() {
+        use std::path::PathBuf;
+
+        // 最常见的一种：canonicalize 的返回值
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\C:\Users\a\b")),
+            PathBuf::from(r"C:\Users\a\b")
+        );
+        // 盘根
+        assert_eq!(strip_verbatim(Path::new(r"\\?\C:\")), PathBuf::from(r"C:\"));
+        // UNC
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\UNC\server\share\dir")),
+            PathBuf::from(r"\\server\share\dir")
+        );
+        // 本来就干净的路径原样返回
+        assert_eq!(
+            strip_verbatim(Path::new(r"C:\Users\a")),
+            PathBuf::from(r"C:\Users\a")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\server\share\d")),
+            PathBuf::from(r"\\server\share\d")
+        );
+        // 相对路径不动
+        assert_eq!(strip_verbatim(Path::new(r"a\b")), PathBuf::from(r"a\b"));
+        // 卷 GUID 没有 DOS 等价形式，必须原样保留
+        let vol = r"\\?\Volume{11111111-2222-3333-4444-555555555555}\x";
+        assert_eq!(strip_verbatim(Path::new(vol)), PathBuf::from(vol));
+    }
 
     #[test]
     fn cross_device_detects_exdev() {

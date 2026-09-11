@@ -123,17 +123,37 @@ pub fn load() -> Result<Ledger> {
 
 pub fn load_from(path: &Path) -> Result<Ledger> {
     match std::fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str(&s).map_err(|e| {
-            Error::Ledger(format!(
-                "台账 {} 解析失败: {e}。文件可能已损坏，可手动检查或删除。",
-                path.display()
-            ))
-        }),
+        Ok(s) => {
+            let mut ledger: Ledger = serde_json::from_str(&s).map_err(|e| {
+                Error::Ledger(format!(
+                    "台账 {} 解析失败: {e}。文件可能已损坏，可手动检查或删除。",
+                    path.display()
+                ))
+            })?;
+            migrate_verbatim_paths(&mut ledger);
+            Ok(ledger)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Ledger {
             version: 1,
             entries: Vec::new(),
         }),
         Err(e) => Err(Error::io(path, e)),
+    }
+}
+
+/// 归一化旧版本写下的 Windows verbatim 路径。
+///
+/// 0.1.0 曾把 `std::fs::canonicalize` 的结果直接当成台账的键，于是记下的是
+/// `\\?\C:\Users\...`。现在的 `canonical_key` 返回的是 `C:\Users\...`，
+/// 两者对不上，`restore` 会报「台账里没有记录」。读的时候顺手改过来，下一次
+/// 写回台账就彻底干净了。
+fn migrate_verbatim_paths(ledger: &mut Ledger) {
+    for e in &mut ledger.entries {
+        e.source = crate::platform::strip_verbatim(&e.source);
+        e.target = crate::platform::strip_verbatim(&e.target);
+        if let Some(real) = &e.original_real_path {
+            e.original_real_path = Some(crate::platform::strip_verbatim(real));
+        }
     }
 }
 

@@ -13,7 +13,7 @@ fn cshl() -> Command {
     let mut exe = std::env::current_exe().expect("拿不到测试二进制路径");
     exe.pop(); // deps/
     exe.pop(); // debug/
-    exe.push("cshl");
+    exe.push(format!("cshl{}", std::env::consts::EXE_SUFFIX)); // Windows 上是 cshl.exe
     assert!(
         exe.exists(),
         "找不到 cshl 二进制（{}）。先跑 cargo build。",

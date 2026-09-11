@@ -60,11 +60,11 @@ pub struct MoveArgs {
     /// 要搬走的源文件夹
     pub source: PathBuf,
 
-    /// 目标位置（必须不存在，或是一个空目录）
+    /// 目标位置（必须不存在，或是一个空目录；父路径不存在会自动创建）
     pub target: PathBuf,
 
-    /// 工作线程数（默认：复制 = 逻辑核数×4 上限 32，删除 = 逻辑核数）
-    #[arg(short = 't', long)]
+    /// 工作线程数（默认按本机逻辑核数算出，见 --help）
+    #[arg(short = 't', long, help = threads_help(), long_help = threads_long_help())]
     pub threads: Option<usize>,
 
     /// 预演：扫描并报告将要发生什么，但不做任何改动
@@ -101,8 +101,8 @@ pub struct RestoreArgs {
     /// 之前被迁移的源路径（即现在那个链接所在的位置）
     pub source: PathBuf,
 
-    /// 工作线程数
-    #[arg(short = 't', long)]
+    /// 工作线程数（默认按本机逻辑核数算出，见 --help）
+    #[arg(short = 't', long, help = threads_help(), long_help = threads_long_help())]
     pub threads: Option<usize>,
 
     /// 预演
@@ -123,6 +123,35 @@ pub enum LinkType {
     Junction,
     /// 符号链接：Unix 上的唯一选择；Windows 上需要管理员权限或开发者模式
     Symlink,
+}
+
+/// `-t` 在 `-h` 里的一行说明。
+///
+/// 默认值是按本机逻辑核数现算的，所以直接把**算出来的数字**印出来，而不是
+/// 给一条 `核数×4 上限 32` 的公式 —— 用户不该为了知道默认是多少而先去数
+/// 自己有几个核。
+fn threads_help() -> String {
+    format!(
+        "工作线程数（本机默认：复制 {}，删除 {}）",
+        crate::migrate::default_copy_threads(),
+        crate::migrate::default_remove_threads(),
+    )
+}
+
+/// `-t` 在 `--help` 里的详细说明：除了数字，还要讲清怎么调。
+fn threads_long_help() -> String {
+    format!(
+        "工作线程数。\n\n\
+         不指定时按本机 {cores} 个逻辑核算出：复制 {copy}（核数×4，上限 32），\
+         删除 {remove}（核数×1）。\n\n\
+         复制是 I/O 密集而非 CPU 密集，线程数高于核数才能把 NVMe 的队列喂满；\
+         机械盘上并发过高反而会导致寻道抖动，那种场景建议 -t 1。\
+         删除以元数据操作为主，按核数来就够。\n\n\
+         注意同卷迁移是一次原子 rename，不开线程，这个参数不起作用。",
+        cores = crate::migrate::logical_cores(),
+        copy = crate::migrate::default_copy_threads(),
+        remove = crate::migrate::default_remove_threads(),
+    )
 }
 
 /// 进程入口：解析、分发、渲染错误，返回退出码。

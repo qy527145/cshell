@@ -160,8 +160,12 @@ fn contains_current_dir(path: &Path) -> Option<String> {
 }
 
 /// 尽力规范化路径；路径不存在时退回原值。
+///
+/// 走 [`crate::link::canonicalize`] 而非 `std::fs::canonicalize`：后者在
+/// Windows 上返回 `\\?\C:\...`，而失败时的退路是原样返回的普通形式 ——
+/// 两者混在一起比较，`starts_with` 永远不成立，安全检查会静默失效。
 pub fn canonical_or_self(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    crate::link::canonicalize(path).unwrap_or_else(|_| crate::platform::strip_verbatim(path))
 }
 
 #[cfg(test)]

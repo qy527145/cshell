@@ -170,10 +170,23 @@ pub fn repoint_dir_link(
 /// 用户书写的那个路径形式。同时路径可能还不存在（比如刚要创建的 target），
 /// `canonicalize` 会直接失败。
 pub fn absolutize(path: &Path) -> io::Result<PathBuf> {
-    if path.is_absolute() {
-        return Ok(normalize_dots(path));
-    }
-    Ok(normalize_dots(&std::env::current_dir()?.join(path)))
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    // 用户可能自己就写了 \\?\C:\...，先归一成普通形式
+    Ok(normalize_dots(&platform::strip_verbatim(&abs)))
+}
+
+/// 完全解析一个路径（链套链也能到底），并去掉 Windows 的 `\\?\` 前缀。
+///
+/// 凡是结果会被存进台账、打印给用户、或写进链接的地方，都必须走这个包装而
+/// 不是直接调 `std::fs::canonicalize` —— 后者在 Windows 上返回 verbatim
+/// 形式，会让 junction 的 SubstituteName 变成 `\??\\\?\C:\path`，建出一个
+/// 看着成功、进去却是空的链接。详见 [`platform::strip_verbatim`]。
+pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+    std::fs::canonicalize(path).map(|p| platform::strip_verbatim(&p))
 }
 
 /// 规范化到「唯一形式」：解析父目录里的所有符号链接，但**保留最后一段**。
@@ -194,7 +207,7 @@ pub fn canonical_key(path: &Path) -> io::Result<PathBuf> {
     };
 
     match std::fs::canonicalize(parent) {
-        Ok(real_parent) => Ok(real_parent.join(name)),
+        Ok(real_parent) => Ok(platform::strip_verbatim(&real_parent).join(name)),
         Err(_) => Ok(abs),
     }
 }
@@ -298,6 +311,61 @@ mod tests {
         // 父目录也不存在时退回词法结果，不该失败
         let k2 = canonical_key(&d.join("no/such/parent")).unwrap();
         assert!(k2.ends_with("parent"));
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// verbatim 前缀绝不能流进任何一处会被存下来或写进链接的路径。
+    /// 它曾让 junction 的 SubstituteName 变成 `\??\\\?\C:\path`，
+    /// 建出一个看着成功、进去却是空的链接。
+    #[test]
+    fn canonical_key_has_no_verbatim_prefix() {
+        let d = tmpdir("verbatim");
+        let inner = d.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+
+        for p in [&d, &inner] {
+            let k = canonical_key(p).unwrap();
+            assert!(
+                !k.to_string_lossy().starts_with(r"\\?\"),
+                "规范化后的路径不能带 \\\\?\\ 前缀，实际 {}",
+                k.display()
+            );
+        }
+
+        // 用户自己写 \\?\ 前缀时也要归一到同一个键
+        #[cfg(windows)]
+        {
+            let verbatim = PathBuf::from(format!(r"\\?\{}", inner.display()));
+            assert_eq!(
+                canonical_key(&verbatim).unwrap(),
+                canonical_key(&inner).unwrap(),
+                "带前缀与不带前缀必须归一成同一个键"
+            );
+        }
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 链接必须真的能读穿 —— 只检查「创建成功」是不够的：
+    /// 目标路径写坏的 junction 一样会创建成功，只是进去空空如也。
+    #[test]
+    fn link_to_canonicalized_target_is_traversable() {
+        let d = tmpdir("traverse");
+        let target = d.join("target");
+        let link = d.join("link");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("payload.txt"), b"payload").unwrap();
+
+        // 关键：目标先过一遍完全解析，模拟 migrate 里真实的调用路径
+        let resolved = canonicalize(&target).unwrap();
+        create_dir_link(&resolved, &link, LinkType::Junction).unwrap();
+
+        assert_eq!(
+            std::fs::read(link.join("payload.txt")).unwrap(),
+            b"payload",
+            "透过链接读不到内容 —— 链接目标写坏了"
+        );
 
         std::fs::remove_dir_all(&d).ok();
     }

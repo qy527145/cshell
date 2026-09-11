@@ -55,14 +55,22 @@ pub fn run_move(args: &MoveArgs) -> Result<()> {
 
     safety::enforce(&job.real_source, args.force)?;
 
-    let copy_threads = args.threads.unwrap_or_else(default_copy_threads);
-    let remove_threads = args.threads.unwrap_or_else(default_remove_threads);
+    let threads = Threads::resolve(args);
 
     if args.dry_run {
-        return dry_run(&job, copy_threads);
+        return dry_run(&job, &threads);
     }
 
     let started = Instant::now();
+
+    // 目标的父目录不存在就自动补齐。放在 dry-run 之后 —— 预演承诺「不做任何
+    // 改动」，建目录也算改动。guard 会在后面任何一步失败时把新建的空目录撤掉。
+    let created_parents = CreatedParents(create_parents(&job.target)?);
+    if args.verbose && !created_parents.0.is_empty() {
+        for dir in &created_parents.0 {
+            println!("已创建目标父目录：{}", dir.display());
+        }
+    }
 
     // 台账：先写 inflight，再动手。崩溃时用户至少知道发生过什么。
     let entry = Entry {
@@ -96,9 +104,7 @@ pub fn run_move(args: &MoveArgs) -> Result<()> {
                 dirs: 0,
             }
         }
-        Err(e) if platform::is_cross_device(&e) => {
-            cross_volume_move(&job, args, copy_threads, remove_threads)?
-        }
+        Err(e) if platform::is_cross_device(&e) => cross_volume_move(&job, args, &threads)?,
         Err(e) => {
             // rename 因为别的原因失败（目标已存在、权限不足……）
             rollback_ledger(&job.source);
@@ -124,6 +130,9 @@ pub fn run_move(args: &MoveArgs) -> Result<()> {
             .unwrap_or_else(|| "none".to_string());
     })?;
 
+    // 到这里迁移已彻底完成，自动创建的父目录留下不再回收
+    created_parents.commit();
+
     report_success(&job, &outcome, link_kind, started, args);
     Ok(())
 }
@@ -135,20 +144,59 @@ struct Outcome {
     dirs: usize,
 }
 
+/// 本次迁移实际采用的线程数。
+///
+/// 复制和删除的默认值不一样（见 [`default_copy_threads`]），但 `-t` 一旦指定
+/// 就两边都用它 —— 集中在这里算一次，省得 `--verbose` / `--dry-run` 各自
+/// 推一遍还推错。
+struct Threads {
+    copy: usize,
+    remove: usize,
+    /// 是不是用户用 `-t` 显式指定的
+    explicit: bool,
+}
+
+impl Threads {
+    fn resolve(args: &MoveArgs) -> Self {
+        match args.threads {
+            Some(n) => Threads {
+                copy: n,
+                remove: n,
+                explicit: true,
+            },
+            None => Threads {
+                copy: default_copy_threads(),
+                remove: default_remove_threads(),
+                explicit: false,
+            },
+        }
+    }
+
+    /// 给 `--verbose` 与 `--dry-run` 用的一行说明。
+    fn describe(&self) -> String {
+        format!(
+            "复制 {}，删除 {}（{}）",
+            self.copy,
+            self.remove,
+            if self.explicit {
+                "-t 指定"
+            } else {
+                "按本机逻辑核数自动选择"
+            }
+        )
+    }
+}
+
 /// 跨卷迁移的四个阶段。
-fn cross_volume_move(
-    job: &Job,
-    args: &MoveArgs,
-    copy_threads: usize,
-    remove_threads: usize,
-) -> Result<Outcome> {
+fn cross_volume_move(job: &Job, args: &MoveArgs, threads: &Threads) -> Result<Outcome> {
     if args.verbose {
         println!("跨卷迁移：需要复制数据");
+        println!("线程数：{}", threads.describe());
     }
 
     // ---- 阶段 1：扫描 ----
     let scan_start = Instant::now();
-    let plan = crate::plan::scan(&job.real_source, copy_threads).inspect_err(|_| {
+    let plan = crate::plan::scan(&job.real_source, threads.copy).inspect_err(|_| {
         rollback_ledger(&job.source);
     })?;
     let scan_time = scan_start.elapsed();
@@ -193,7 +241,7 @@ fn cross_volume_move(
     let progress = Arc::new(copy::Progress::new());
     let reporter = spawn_progress_reporter(&plan, Arc::clone(&progress), args);
 
-    let progress = copy::copy_tree(&job.real_source, &partial, &plan, copy_threads, progress);
+    let progress = copy::copy_tree(&job.real_source, &partial, &plan, threads.copy, progress);
 
     if let Some(r) = reporter {
         r.finish();
@@ -244,7 +292,7 @@ fn cross_volume_move(
     let rm_progress = remove::remove_tree(
         &job.real_source,
         &plan,
-        remove_threads,
+        threads.remove,
         Arc::new(remove::RemoveProgress::new()),
     );
 
@@ -323,7 +371,7 @@ fn resolve_job(args: &MoveArgs) -> Result<Job> {
             }
 
             // 穿透：完全解析到真实目录（链套链也能到底）
-            let real = std::fs::canonicalize(&source).map_err(|e| {
+            let real = link::canonicalize(&source).map_err(|e| {
                 Error::io(
                     &source,
                     std::io::Error::new(e.kind(), format!("无法解析链接指向的真实目录: {e}")),
@@ -395,20 +443,110 @@ fn validate_paths(source: &Path, real_source: &Path, target: &Path) -> Result<()
         std::fs::remove_dir(target).map_err(|e| Error::io(target, e))?;
     }
 
-    // 目标的父目录必须存在 —— 我们不替用户创建多层路径，
-    // 那容易在打错字时建出一堆意外的目录。
-    let parent = target
-        .parent()
-        .ok_or_else(|| Error::invalid(target, "目标路径没有父目录"))?;
-    if !parent.is_dir() {
-        return Err(Error::invalid(parent, "目标的父目录不存在，请先创建它"));
+    // 目标的父目录必须存在 —— 不存在的话由 [`create_parents`] 在真正动手前
+    // 补齐（dry-run 不会创建任何东西）。这里只确认 target 本身有父目录可言。
+    if target.parent().is_none() {
+        return Err(Error::invalid(target, "目标路径没有父目录"));
     }
 
     Ok(())
 }
 
+/// 算出为了让 `target` 落位，需要新建哪几层父目录。**只看不动手。**
+///
+/// 返回值按「从浅到深」排列。已经存在的层级不会出现在里面 —— 后面
+/// [`CreatedParents`] 要靠它决定失败时删哪些，绝不能把用户原有的目录
+/// 也当成自己的产物。
+///
+/// `--dry-run` 和真正执行共用这一个函数，这样预演报的和实际做的不会走偏。
+fn missing_parents(target: &Path) -> Result<Vec<PathBuf>> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| Error::invalid(target, "目标路径没有父目录"))?;
+
+    if parent.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    // 从最深的缺失层一路往上，走到第一个已存在的祖先为止
+    let mut missing = Vec::new();
+    let mut cur = parent;
+    loop {
+        if cur.is_dir() {
+            break;
+        }
+        // 存在但不是目录：中间挡着一个文件，再往下建必然失败，
+        // 不如在这里给一句说得清的话
+        if cur.symlink_metadata().is_ok() {
+            return Err(Error::invalid(cur, "目标路径中的这一段已存在，但不是目录"));
+        }
+        match cur.parent() {
+            Some(up) => {
+                missing.push(cur.to_path_buf());
+                cur = up;
+            }
+            // 一路走到根都不存在 —— 那是盘符/挂载点的问题，不是「还没建目录」。
+            // mkdir 一个不存在的盘根是办不到的，别假装能修。
+            None => {
+                return Err(Error::invalid(
+                    cur,
+                    "这个盘符（或根路径）不存在，无法在其中创建目录",
+                ))
+            }
+        }
+    }
+
+    // 反过来，从浅到深依次创建
+    missing.reverse();
+    Ok(missing)
+}
+
+/// 逐级补齐 `target` 缺失的父目录，返回**本次新建**的那几层。
+///
+/// 层级由 [`missing_parents`] 算出；返回值交给 [`CreatedParents`] 在失败时
+/// 反着删回去。
+fn create_parents(target: &Path) -> Result<Vec<PathBuf>> {
+    let missing = missing_parents(target)?;
+
+    let mut created = Vec::with_capacity(missing.len());
+    for dir in missing {
+        platform::create_dir(&dir).map_err(|e| Error::io(&dir, e))?;
+        created.push(dir);
+    }
+    Ok(created)
+}
+
+/// 自动补出来的父目录，迁移失败时负责撤销。
+///
+/// 用 `Drop` 而不是在每个错误分支手动清理：`cross_volume_move` 里有近十处
+/// 提前返回，漏掉任何一处都会在用户打错路径时留下一串空目录 —— 而「怕留下
+/// 意外的空目录」正是这里当初直接报错、不肯自动创建的原因。
+///
+/// 只删**自己建的**、且**仍然为空**的目录：[`platform::remove_dir`] 删不动
+/// 非空目录，所以数据真落进去了的话这里会安全地失败。
+struct CreatedParents(Vec<PathBuf>);
+
+impl CreatedParents {
+    /// 迁移成功，这些目录留下。
+    fn commit(mut self) {
+        self.0.clear();
+    }
+}
+
+impl Drop for CreatedParents {
+    fn drop(&mut self) {
+        // 由深到浅：先删最里面那层，外层才可能变空
+        for dir in self.0.iter().rev() {
+            if platform::remove_dir(dir).is_err() {
+                // 最深的一层都删不掉（非空），外面几层更不可能空
+                break;
+            }
+        }
+    }
+}
+
 /// `--dry-run`：扫描并报告，不做任何改动。
-fn dry_run(job: &Job, threads: usize) -> Result<()> {
+fn dry_run(job: &Job, threads: &Threads) -> Result<()> {
     println!("预演模式 —— 不会做任何改动\n");
 
     println!("  源:   {}", job.real_source.display());
@@ -419,6 +557,16 @@ fn dry_run(job: &Job, threads: usize) -> Result<()> {
         );
     }
     println!("  目标: {}", job.target.display());
+    match missing_parents(&job.target) {
+        Ok(dirs) if !dirs.is_empty() => println!(
+            "        （父目录不存在，将自动创建 {} 层，最深一层是 {}）",
+            dirs.len(),
+            dirs.last().expect("刚判过非空").display()
+        ),
+        // 预演的职责是把「真跑会发生什么」如实说出来，包括「会失败」
+        Err(e) => println!("        ⚠️  {e}，实际执行会被拒绝"),
+        _ => {}
+    }
 
     let same_vol = volume::same_volume(&job.real_source, &job.target);
     match same_vol {
@@ -432,8 +580,10 @@ fn dry_run(job: &Job, threads: usize) -> Result<()> {
         None => println!("\n  判定: 无法预先探测卷，执行时以 rename 的返回值为准"),
     }
 
+    println!("  线程: {}", threads.describe());
+
     let start = Instant::now();
-    let plan = crate::plan::scan(&job.real_source, threads)?;
+    let plan = crate::plan::scan(&job.real_source, threads.copy)?;
     let elapsed = start.elapsed();
 
     println!("\n  将要搬运:");
@@ -684,15 +834,20 @@ fn restore_cross_volume(job: &Job, threads: usize, verbose: bool) -> Result<Outc
 
 /// 复制是 I/O 密集而非 CPU 密集，线程数可以超过核数 —— 高队列深度才能
 /// 让 NVMe 跑满。但机械盘上并发过高会导致寻道抖动，那种场景应手动 `-t 1`。
-fn default_copy_threads() -> usize {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    (cores * 4).min(32)
+///
+/// 公开是为了让 `--help` 能把**算出来的数字**直接印给用户看
+/// （见 [`crate::cli`]），而不是只给一条公式让人自己去数核。
+pub fn default_copy_threads() -> usize {
+    (logical_cores() * 4).min(32)
 }
 
 /// 删除以元数据操作为主，按核数来就够。
-fn default_remove_threads() -> usize {
+pub fn default_remove_threads() -> usize {
+    logical_cores()
+}
+
+/// 本机逻辑核数，探测不到时按 4 估。
+pub fn logical_cores() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -886,17 +1041,155 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_missing_target_parent() {
-        let d = tmpdir("noparent");
+    fn create_parents_builds_the_whole_chain() {
+        let d = tmpdir("mkparents");
         let src = d.join("src");
         std::fs::create_dir(&src).unwrap();
-        let target = d.join("does/not/exist");
+        let target = d.join("a/b/c/target");
 
-        let err = validate_paths(&src, &src, &target).unwrap_err();
+        // 缺失的父目录不再是错误
+        validate_paths(&src, &src, &target).unwrap();
+
+        let created = create_parents(&target).unwrap();
+        assert!(target.parent().unwrap().is_dir(), "整条路径都该被建出来");
+        assert_eq!(created.len(), 3, "应记下自己新建的三层：{created:?}");
+        assert!(created[0].ends_with("a"), "返回值要从浅到深排列");
+        assert!(created[2].ends_with("c"));
+        // target 本身不该被创建 —— 那是 rename 的落点
+        assert!(!target.exists());
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn create_parents_only_reports_dirs_it_made() {
+        let d = tmpdir("mkpartial");
+        let existing = d.join("already");
+        std::fs::create_dir(&existing).unwrap();
+        let target = existing.join("new/target");
+
+        let created = create_parents(&target).unwrap();
+        assert_eq!(created.len(), 1, "已存在的层级不能算进来：{created:?}");
+        assert!(created[0].ends_with("new"));
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn create_parents_is_a_noop_when_parent_exists() {
+        let d = tmpdir("mknoop");
+        let target = d.join("target");
+        assert!(create_parents(&target).unwrap().is_empty());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn create_parents_rejects_a_file_in_the_way() {
+        let d = tmpdir("mkblocked");
+        let blocker = d.join("blocker");
+        std::fs::write(&blocker, b"i am not a directory").unwrap();
+
+        let err = create_parents(&blocker.join("sub/target")).unwrap_err();
         assert!(
-            err.to_string().contains("父目录不存在"),
-            "应提示父目录不存在: {err}"
+            err.to_string().contains("不是目录"),
+            "路径中间挡着文件时要说清楚: {err}"
         );
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 一路缺到根，说明是盘符/挂载点不存在 —— 那不是「还没建目录」，
+    /// mkdir 一个不存在的盘根是办不到的，不能假装能自动补。
+    #[test]
+    fn create_parents_refuses_to_invent_a_missing_root() {
+        #[cfg(windows)]
+        let target = Path::new(r"Q:\nope\deeper\target");
+        #[cfg(not(windows))]
+        let target = Path::new("/nonexistent_root_xyz/nope/target");
+
+        // 真有这个盘/目录的机器上这个断言没意义，跳过
+        #[cfg(windows)]
+        if Path::new(r"Q:\").is_dir() {
+            return;
+        }
+        #[cfg(not(windows))]
+        if Path::new("/nonexistent_root_xyz").exists() {
+            return;
+        }
+
+        #[cfg(windows)]
+        {
+            let err = missing_parents(target).unwrap_err();
+            assert!(
+                err.to_string().contains("盘符"),
+                "应指出是盘符不存在而不是说要自动创建: {err}"
+            );
+        }
+        // Unix 上 / 总是存在，缺的层级是可以真建出来的，
+        // 所以这里只确认它不报错地给出待建列表
+        #[cfg(not(windows))]
+        assert!(!missing_parents(target).unwrap().is_empty());
+    }
+
+    /// 预演算出来的待建层级，必须和真跑时建出来的完全一致。
+    #[test]
+    fn missing_parents_matches_what_create_parents_makes() {
+        let d = tmpdir("mkmatch");
+        let target = d.join("m/n/o/target");
+
+        let planned = missing_parents(&target).unwrap();
+        let created = create_parents(&target).unwrap();
+        assert_eq!(planned, created, "预演与实际必须一致");
+        // 算完之后再算一次：这次一层都不缺了
+        assert!(missing_parents(&target).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 迁移失败时，自动建出来的空目录要撤干净 —— 打错一个路径不该在磁盘上
+    /// 留下一串空壳。
+    #[test]
+    fn created_parents_are_rolled_back_on_failure() {
+        let d = tmpdir("mkrollback");
+        let target = d.join("x/y/z/target");
+
+        let created = create_parents(&target).unwrap();
+        assert!(d.join("x/y/z").is_dir());
+
+        drop(CreatedParents(created));
+
+        assert!(!d.join("x").exists(), "失败后自动建的目录应全部撤掉");
+        assert!(d.is_dir(), "原本就存在的目录不能动");
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 反过来：数据已经落进去了就绝不能删。
+    #[test]
+    fn created_parents_rollback_spares_nonempty_dirs() {
+        let d = tmpdir("mkkeep");
+        let target = d.join("x/y/target");
+
+        let created = create_parents(&target).unwrap();
+        // 模拟 rename 已经把数据放到位
+        std::fs::create_dir(&target).unwrap();
+
+        drop(CreatedParents(created));
+
+        assert!(target.is_dir(), "非空目录必须原样保留");
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn created_parents_commit_keeps_everything() {
+        let d = tmpdir("mkcommit");
+        let target = d.join("x/y/target");
+
+        let created = create_parents(&target).unwrap();
+        CreatedParents(created).commit();
+
+        assert!(d.join("x/y").is_dir(), "commit 之后目录必须留下");
 
         std::fs::remove_dir_all(&d).ok();
     }

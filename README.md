@@ -32,7 +32,7 @@ cshl restore <SOURCE>      # 搬回原位并删除链接
 |---|---|
 | `-n, --dry-run` | 预演：扫描并报告将要发生什么，不做任何改动 |
 | `-v, --verbose` | 输出每一步的细节与耗时 |
-| `-t, --threads <N>` | 工作线程数（机械硬盘上建议 `-t 1` 以免寻道抖动） |
+| `-t, --threads <N>` | 工作线程数（默认按本机逻辑核数算出，`cshl --help` 会印出实际数字；机械硬盘上建议 `-t 1` 以免寻道抖动） |
 | `--no-link` | 只搬走，不留链接 |
 | `--no-follow-link` | source 本身已是链接时报错退出，而不是穿透 |
 | `--link-type <junction\|symlink>` | 仅 Windows 有效，默认 junction |
@@ -96,6 +96,7 @@ cshl: 迁移已中止，源目录未被改动: /tmp/tree/a/locked.bin: Permissio
 - **拒绝自吞**——目标在源内部、源在目标内部、两者相同，一律拒绝（`--force` 也不行）
 - **拒绝覆盖**——目标已存在且非空时拒绝；「不覆盖」由内核保证（`RENAME_NOREPLACE` / `RENAME_EXCL` / 不传 `MOVEFILE_REPLACE_EXISTING`），而不是先 `exists()` 再 rename，消除 TOCTOU 竞争
 - **系统目录保护**——卷根、`/usr`、`C:\Windows` 这类目录禁止迁移，`--force` 也不行
+- **自动补齐目标父目录**——目标的父路径不存在时逐级创建；迁移失败会把自己新建的那几层空目录撤回去，打错路径不会在磁盘上留下空壳（`--dry-run` 只报告、不创建）
 - **台账文件锁**——并发的多个 `cshl` 不会互相覆盖记录
 
 ## 正确处理的边界情况
