@@ -1,0 +1,64 @@
+[package]
+name = "cshell"
+version = "0.1.0"
+edition = "2021"
+authors = ["wmymz"]
+description = "cshell —— 极速跨平台文件夹迁移工具：搬走目录，原地留链接"
+license = "MIT"
+repository = "https://github.com/qy527145/cshell"
+homepage = "https://github.com/qy527145/cshell"
+readme = "README.md"
+keywords = ["filesystem", "move", "junction", "symlink", "performance"]
+categories = ["command-line-utilities", "filesystem"]
+default-run = "cshl"
+
+[lib]
+name = "cshell"
+path = "src/lib.rs"
+
+# cshl —— 唯一的 CLI 二进制
+[[bin]]
+name = "cshl"
+path = "src/bin/cshl.rs"
+
+[dependencies]
+# CLI 解析
+clap = { version = "4.6", features = ["derive"] }
+# 并行复制 / 删除的工作队列
+crossbeam-channel = "0.5"
+# 台账（ledger）序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 错误上下文
+anyhow = "1"
+# 解析 ~/.cshell 目录
+dirs = "6"
+# 进度展示（--quiet 可关）
+indicatif = "0.17"
+
+# Unix（macOS / Linux / 其他）原生系统调用
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
+
+# Windows 原生 API
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Wdk_Storage_FileSystem",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+# cargo-dist 发布 profile
+[profile.dist]
+inherits = "release"
+lto = "thin"

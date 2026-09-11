@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: 测试 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # 跨卷路径在本地开发机上靠 hdiutil 造卷验证，CI 上则用各平台
+      # 现成的第二个文件系统：Linux 的 tmpfs (/dev/shm)，macOS 的
+      # hdiutil 磁盘映像。Windows 上 runner 只有一个卷，跨卷用例会
+      # 自动跳过（集成测试里的 cross_volume_target 找不到就返回 None）。
+      - name: 准备跨卷测试用的第二个卷 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          hdiutil create -size 500m -fs APFS -volname cshltest /tmp/cshltest.dmg -quiet
+          hdiutil attach /tmp/cshltest.dmg
+          df -h /Volumes/cshltest
+
+      - name: 构建
+        run: cargo build --all-targets
+
+      - name: 测试
+        run: cargo test -- --nocapture
+
+      - name: 卸载第二个卷 (macOS)
+        if: always() && runner.os == 'macOS'
+        run: hdiutil detach /Volumes/cshltest || true
+
+  # Windows 上的 junction 只有真机能验证：reparse buffer 是手工构造的，
+  # 类型检查通不过不了它到底能不能被系统接受。
+  windows-junction:
+    name: Windows junction 冒烟测试
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 构建
+        run: cargo build --release
+
+      - name: 迁移并验证留下的是真 junction
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:CSHELL_HOME = "$env:TEMP\cshell-ci"
+
+          New-Item -ItemType Directory -Force -Path "$env:TEMP\jt\src\sub" | Out-Null
+          "hello" | Out-File -FilePath "$env:TEMP\jt\src\a.txt" -Encoding utf8
+          "deep"  | Out-File -FilePath "$env:TEMP\jt\src\sub\b.txt" -Encoding utf8
+
+          .\target\release\cshl.exe -v "$env:TEMP\jt\src" "$env:TEMP\jt\dst"
+          if ($LASTEXITCODE -ne 0) { throw "迁移失败" }
+
+          # 目录列表里应显示为 <JUNCTION>
+          $listing = cmd /c dir "$env:TEMP\jt" 2>&1 | Out-String
+          Write-Host $listing
+          if ($listing -notmatch "JUNCTION") {
+              throw "原地留下的不是 junction"
+          }
+
+          # reparse tag 必须是 Mount Point
+          $tag = fsutil reparsepoint query "$env:TEMP\jt\src" | Out-String
+          Write-Host $tag
+          if ($tag -notmatch "Mount Point") {
+              throw "reparse tag 不是 Mount Point"
+          }
+
+          # 透过 junction 能读到内容
+          $content = Get-Content "$env:TEMP\jt\src\sub\b.txt"
+          if ($content -notmatch "deep") { throw "透过 junction 读不到内容" }
+
+          # 还原
+          .\target\release\cshl.exe restore "$env:TEMP\jt\src"
+          if ($LASTEXITCODE -ne 0) { throw "还原失败" }
+          if (-not (Test-Path "$env:TEMP\jt\src\sub\b.txt")) { throw "还原后内容丢失" }
+
+          Write-Host "✓ junction 创建、读取、还原全部正常"
